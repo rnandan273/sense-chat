@@ -1,0 +1,59 @@
+(ns senseforth-chat.routes.websockets
+ (:gen-class)
+ (:require [compojure.core :refer [GET defroutes]]
+           [org.httpkit.server
+            :refer [send! with-channel on-close on-receive]]
+           [cognitect.transit :as t]
+           [taoensso.timbre :as timbre]
+           [langohr.core      :as rmq]
+           [langohr.channel   :as lch]
+           [langohr.exchange  :as le]
+           [langohr.queue     :as lq]
+           [langohr.consumers :as lc]
+           [langohr.basic     :as lb])
+ (:use [clojure.string :only (join split)]))
+
+(def ^{:const true}
+  default-exchange-name "")
+
+(defonce channels (atom []))
+
+(defonce privateqs (atom []))
+
+(defonce userqs (atom {}))
+
+(defn connect! [channel]
+ (timbre/info "channel open")
+ (swap! channels conj channel))
+
+(defn disconnect! [channel status]
+ (timbre/info "channel closed:" status)
+ (swap! channels #(remove #{channel} %)))
+
+
+(defn ws-handler [request]
+ (with-channel request channel
+ 	           (connect! channel)
+               (on-close channel (partial disconnect! channel))
+               (on-receive channel (fn [data]  
+               	  (let [msg (get (split data #",") 2)
+				  	    user-tok  (first (split (subs msg 0 (.length msg)) #" "))
+				  	    ch    (lch/open (rmq/connect))
+				        qname "langohr.senseforth.chat"]
+				   		(timbre/info "Userqs " @userqs)
+				   		(if (contains? @userqs (keyword user-tok))
+				   			(timbre/info "Queue present" ((keyword user-tok) @userqs))
+				   		     (let [conn  (rmq/connect)
+							        ch    (lch/open conn)
+							        queue-name (lq/declare-server-named ch {:exclusive true :auto-delete true})
+							        handler    (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+							                     (timbre/info "In CHANNEL Handler " (String. payload "UTF-8"))
+							                     (send! channel (String. payload "UTF-8"))
+							                     )]
+    								(lc/subscribe ch queue-name handler {:auto-ack true})
+    								(swap! userqs assoc-in [(keyword user-tok)] queue-name))))))))
+
+(defroutes websocket-routes
+ (GET "/ws" request (ws-handler request)))
+
+

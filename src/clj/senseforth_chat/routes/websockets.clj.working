@@ -1,0 +1,101 @@
+(ns senseforth-chat.routes.websockets
+ (:gen-class)
+ (:require [compojure.core :refer [GET defroutes]]
+           [org.httpkit.server
+            :refer [send! with-channel on-close on-receive]]
+           [cognitect.transit :as t]
+           [taoensso.timbre :as timbre]
+           [langohr.core      :as rmq]
+           [langohr.channel   :as lch]
+           [langohr.exchange  :as le]
+           [langohr.queue     :as lq]
+           [langohr.consumers :as lc]
+           [langohr.basic     :as lb])
+ (:use [clojure.string :only (join split)]))
+
+(def ^{:const true}
+  default-exchange-name "")
+
+(defonce channels (atom []))
+
+(defonce privateqs (atom []))
+
+(defonce userqs (atom {}))
+(defonce ch    (lch/open (rmq/connect)))
+
+(defn connect! [channel]
+ (timbre/info "channel open")
+	(swap! channels conj channel))
+
+(defn disconnect! [channel status]
+ (timbre/info "channel closed:" status)
+ (swap! channels #(remove #{channel} %)))
+
+(defn ws-handler [request]
+ (with-channel request channel
+               (on-close channel (partial disconnect! channel))
+               (on-receive channel (fn [data] 
+                  (timbre/info "Received - " data)
+               	  (let [msg (get (split data #",") 2)
+				  	    user-tok  (first (split (subs msg 0 (.length msg)) #" "))
+				  	    ;ch    (lch/open (rmq/connect))
+				        req-qname "langohr.senseforth.chatreq"
+                stage1resp-qname "langohr.senseforth.stage1_resp"
+                stage2-qname "langohr.senseforth.stage2_req"
+                stage2resp-qname "langohr.senseforth.stage2_resp"
+                stage3-qname "langohr.senseforth.stage3_req"
+				        resp-qname "langohr.senseforth.chatresp"]
+				   		(timbre/info "Userqs " @userqs)
+				   		(lq/declare ch req-qname {:exclusive false :durable true :auto-delete false})  
+              (lq/declare ch stage2-qname {:exclusive false :durable true :auto-delete false}) 
+              (lq/declare ch stage3-qname {:exclusive false :durable true :auto-delete false}) 
+				   		;(lq/declare ch resp-qname {:exclusive false :durable true :auto-delete false})
+				   		(if (contains? @userqs (keyword user-tok))
+				   			(timbre/info "Queue present" ((keyword user-tok) @userqs))
+				   		     (let [;conn  (rmq/connect)
+							        ;ch    (lch/open conn)
+							        queue-name (lq/declare-server-named ch {:exclusive true :auto-delete true})
+							        handler    (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+							                     (timbre/info "Publishing to user websocket " (String. payload "UTF-8"))
+							                     (send! channel (String. payload "UTF-8"))
+							                     )
+
+							        resp-handler (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                   								   (timbre/info "Received on server response queue" (String. payload "UTF-8"))
+                   								   (let [resp-str (String. payload "UTF-8")
+                   								   	     client-qname (get (split resp-str #":") 0)
+                   								   	     client-msg (get (split resp-str #":") 1)
+                   								   	     resp-modified (str "[\"^ \",\"~:message\"," client-msg)]
+                   								   	 (timbre/info "Publishing to users queue " client-qname " msg " client-msg)
+                   								   	 (lb/publish ch default-exchange-name client-qname resp-modified)))
+
+                      stage1_resp-handler (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                                     (timbre/info "Received on stage1 queue" (String. payload "UTF-8"))
+                                     (let [resp-str (String. payload "UTF-8")]
+                                       (timbre/info "Publishing to stage 2 " stage2-qname " msg " resp-str)
+                                       (lb/publish ch default-exchange-name stage2-qname resp-str)))
+
+                      stage2_resp-handler (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                                     (timbre/info "Received on stage 2  queue" (String. payload "UTF-8"))
+                                     (let [resp-str (String. payload "UTF-8")]
+                                       (timbre/info "Publishing to stage 3 " stage3-qname " msg " resp-str)
+                                       (lb/publish ch default-exchange-name stage3-qname resp-str)))
+							        ]
+							        ;; publish to server request queue
+    								(lc/subscribe ch queue-name handler {:auto-ack true})
+    								(swap! userqs assoc-in [(keyword user-tok)] queue-name)  
+    								;(lb/publish ch default-exchange-name req-qname (str queue-name ":" msg))
+    								
+    								;; for the response que from server															
+                    (lc/subscribe ch stage1resp-qname stage1_resp-handler {:auto-ack true})
+                    (lc/subscribe ch stage2resp-qname stage2_resp-handler {:auto-ack true})
+                    (lc/subscribe ch resp-qname resp-handler {:auto-ack true})
+  									;; till here
+
+    								))				   		 
+    					(lb/publish ch default-exchange-name req-qname (str ((keyword user-tok) @userqs) ":" msg)))))))
+
+(defroutes websocket-routes
+ (GET "/ws" request (ws-handler request)))
+
+

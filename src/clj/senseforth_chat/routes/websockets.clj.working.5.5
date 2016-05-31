@@ -1,0 +1,110 @@
+(ns senseforth-chat.routes.websockets
+ (:gen-class)
+ (:require [compojure.core :refer [GET defroutes]]
+           [org.httpkit.server
+            :refer [send! with-channel on-close on-receive]]
+           [cognitect.transit :as t]
+           [clojure.string :as cstr]
+           [taoensso.timbre :as timbre]
+           [langohr.core      :as rmq]
+           [langohr.channel   :as lch]
+           [langohr.exchange  :as le]
+           [langohr.queue     :as lq]
+           [langohr.consumers :as lc]
+           [langohr.basic     :as lb]
+           [senseforth-chat.routes.es_utils :as eu])
+ (:use [clojure.string :only (join split)]))
+
+(def ^{:const true}
+  default-exchange-name "")
+
+(defonce channels (atom []))
+
+(defonce privateqs (atom []))
+
+(defonce userqs (atom {}))
+
+(defonce ch (lch/open (rmq/connect)))
+
+(defn connect! [channel]
+ (timbre/info "channel open")
+	(swap! channels conj channel))
+
+(defn disconnect! [channel status]
+ (timbre/info "channel closed:" status)
+ (swap! channels #(remove #{channel} %)))
+
+(defn publish-es [raw-msg]
+  (let [token-index (cstr/index-of raw-msg ":")
+        msg-index  (cstr/index-of raw-msg ":" (inc token-index))     
+        stage (subs raw-msg 0 token-index)
+        token (subs raw-msg (inc token-index) msg-index)
+        msg (subs raw-msg (inc msg-index) (count raw-msg))
+        clean-msg-index (cstr/index-of raw-msg " ")
+        pipe-index (cstr/index-of raw-msg "|")
+        ]
+   (if (= nil pipe-index)     
+       (eu/escreate (subs raw-msg (inc clean-msg-index)) "nil" (read-string token) false stage)
+       (eu/escreate (subs raw-msg (inc clean-msg-index) pipe-index) (subs raw-msg (inc pipe-index)) (read-string token) true stage))))
+
+(defn ws-handler [request]
+ (with-channel request channel
+               (on-close channel (partial disconnect! channel))
+               (on-receive channel (fn [data] 
+              (timbre/info "Received - " data)
+              (timbre/info channel)
+               	  
+                (let [msg (subs data (inc (cstr/index-of data "," (inc (cstr/index-of data ",")))) (count data))
+                      user-tok (subs msg 1 (cstr/index-of msg " "))                 
+      				        req-qname "langohr.senseforth.chatreq"
+                      es-qname "langohr.senseforth.es"
+      				        resp-qname "langohr.senseforth.chatresp"]
+				   		(timbre/info "Userqs " @userqs)
+              (timbre/info "msg -> " msg)
+              (timbre/info "Token -> " user-tok)
+                                       
+				   		(lq/declare ch req-qname {:exclusive false :durable true :auto-delete false}) 
+              (lq/declare ch es-qname {:exclusive false :durable true :auto-delete false})  
+              (lb/publish ch default-exchange-name es-qname (str "req" ":" user-tok ":" msg)) 
+				   		(if (contains? @userqs (keyword user-tok))
+				   			   (timbre/info "Queue present" ((keyword user-tok) @userqs))
+				   		     (let [
+							        queue-name (lq/declare-server-named ch {:exclusive true :auto-delete true})
+
+							        handler    (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                                   (let [raw-msg (String. payload "UTF-8")
+                                         resp-msg (subs raw-msg (inc (cstr/index-of raw-msg "," (inc (cstr/index-of raw-msg ",")))) (count raw-msg));;(get (split raw-msg #",") 2)
+                                         token (subs resp-msg 1 (cstr/index-of resp-msg " "))] 
+                                        (lb/publish ch default-exchange-name es-qname (str "resp" ":" token ":" resp-msg))
+							                          (send! channel raw-msg)))
+
+							        resp-handler (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                   								   (timbre/info "Received on server response queue" (String. payload "UTF-8"))
+                   								   (let [resp-str (String. payload "UTF-8")
+                   								   	     client-qname (subs resp-str 0 (cstr/index-of resp-str ":"))
+                   								   	     client-msg (subs resp-str (inc (cstr/index-of resp-str ":")) (count resp-str))
+                   								   	     resp-modified (str "[\"^ \",\"~:message\"," client-msg)]
+                                           (timbre/info "MODIFIED MSG \n")
+                                           (timbre/info resp-modified)
+                                           (timbre/info ">>>>>>\n\n")
+                                           (lb/publish ch default-exchange-name client-qname resp-modified)))
+
+                      es-handler (fn [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
+                                     (timbre/info "Received on ES queue" (String. payload "UTF-8"))
+                                     (publish-es (String. payload "UTF-8"))
+                                     )]
+							        ;; publish to server request queue
+    								(lc/subscribe ch queue-name handler {:auto-ack true})
+    								(swap! userqs assoc-in [(keyword user-tok)] queue-name)              
+                    (lc/subscribe ch resp-qname resp-handler {:auto-ack true})
+                    (lc/subscribe ch es-qname es-handler {:auto-ack true})
+  									;; till here
+
+    								))
+              ;; publish to the request queue				   		 
+    					(lb/publish ch default-exchange-name req-qname (str ((keyword user-tok) @userqs) ":" msg)))))))
+
+(defroutes websocket-routes
+ (GET "/ws" request (ws-handler request)))
+
+
